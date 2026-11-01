@@ -1,0 +1,16 @@
+/* 全局样式：作用于整个页面（App.vue 里的样式是 scoped 的，只管组件内部） */
+
+/* 通配符重置：清掉浏览器给所有元素的默认 margin/padding，
+   并统一 box-sizing，让宽度计算更直观（padding 不会撑大元素） */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* body 全局字体和背景：-apple-system 优先用系统字体（mac/iOS），
+   后面几个是 Windows/安卓 的兜底字体 */
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  background: #f5f5f5;
+}

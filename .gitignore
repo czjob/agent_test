@@ -1,0 +1,56 @@
+# ===================== .gitignore =====================
+# 项目结构：前端 Vite + TypeScript（frontend/），后端 Python（backend/）
+
+# ---------- 依赖（实际存在，必须排除） ----------
+node_modules/
+frontend/node_modules/
+
+# ---------- 前端构建 / 缓存产物 ----------
+dist/
+dist-ssr/
+frontend/dist/
+.vite/
+frontend/.vite/
+*.tsbuildinfo
+
+# ---------- 后端 Python 产物 / 虚拟环境 ----------
+__pycache__/
+backend/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.Python
+.venv/
+venv/
+env/
+backend/.venv/
+backend/venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# ---------- 环境变量 / 密钥（按需创建，切勿入库） ----------
+.env
+.env.*
+*.local
+
+# ---------- 日志 ----------
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------- 编辑器 / IDE ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ---------- 操作系统文件 ----------
+.DS_Store
+Thumbs.db
+
+# ---------- 本地 agent 工作态（记忆 / 缓存，非源码） ----------
+.workbuddy/

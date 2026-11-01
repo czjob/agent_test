@@ -1,0 +1,16 @@
+<!-- Vite 入口 HTML：整个单页应用只有这一个 HTML 文件 -->
+<!-- SPA（单页应用）模式：所有界面切换都在前端完成，不刷新页面 -->
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />                            <!-- 字符集：防止中文乱码 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />  <!-- 移动端适配：按设备宽度渲染 -->
+    <title>LangChain Agent 流式对话</title>              <!-- 浏览器标签页标题 -->
+  </head>
+  <body>
+    <!-- Vue 应用的挂载点：main.ts 里 mount('#app') 挂到这里 -->
+    <div id="app"></div>
+    <!-- type="module"：以 ES Module 方式加载入口脚本，Vite 会接管后续所有模块解析 -->
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
