@@ -1,8 +1,16 @@
 fastapi>=0.100.0
 uvicorn>=0.23.0
-# langchain 1.x 新 Agent API（create_agent + checkpointer）
+# langchain 1.x（手写 Agent 循环用 astream 拿 token 级分片）
 langchain>=1.0.0
 langchain-openai>=0.1.0
 langgraph>=0.2.0
 pydantic>=2.0.0
 python-dotenv>=1.0.0
+
+# ===== 数据库（多用户 + 会话持久化） =====
+sqlalchemy[asyncio]>=2.0
+asyncpg>=0.29
+
+# ===== 认证 =====
+pyjwt>=2.8
+pwdlib[argon2]>=0.2

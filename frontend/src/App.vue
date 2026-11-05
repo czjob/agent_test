@@ -1,333 +1,291 @@
 <script setup lang="ts">
-import { ref, nextTick } from 'vue'
+/**
+ * 应用根组件：只做"装配"和"事件编排"。
+ *
+ * 状态分布：
+ *   useAuth()          登录态（全局单例）
+ *   useConversations() 会话列表 + 当前会话 id（全局单例）
+ *   useMemories()      长期记忆列表（全局单例）
+ *   useChat()          当前会话的消息与发送状态（本组件持有，跟着当前会话切换）
+ *
+ * 这里刻意不用 watch 监听 currentId 去加载消息，而是每个操作里显式调用加载。
+ * 原因：watch 是异步的，"新建会话 → 立刻发消息"这种连贯操作下，
+ * watch 触发的空会话加载可能晚于消息 push 回来，把刚推上去的气泡清掉。
+ */
 
-// ====================== 类型定义 ======================
-interface Message {
-  role: 'user' | 'assistant'
-  content: string
-  toolInfo?: string[]  // 工具调用信息
-}
+import { onMounted, onUnmounted, ref } from 'vue'
 
-// ====================== 状态 ======================
-// ref() 把普通数据变成"响应式"数据：值一变，用到它的界面自动更新
-const messages = ref<Message[]>([])       // 消息列表，页面上的每条聊天气泡都来自它
-const inputText = ref('')                 // 输入框里的文字（v-model 双向绑定）
-const loading = ref(false)                // 是否正在等待回复（控制"回复中..."和光标动画）
-// 会话 ID：每次刷新页面生成一个新的；后端靠它区分不同会话、存取多轮记忆
-const sessionId = ref(`user_${Date.now()}`)
-const chatContainer = ref<HTMLElement>()  // 消息列表 DOM 引用，用于自动滚动到底部
+import { onUnauthorized } from './api/client'
+import ChatInput from './components/ChatInput.vue'
+import ChatWindow from './components/ChatWindow.vue'
+import LoginView from './components/LoginView.vue'
+import MemoryPanel from './components/MemoryPanel.vue'
+import SessionSidebar from './components/SessionSidebar.vue'
+import { useAuth } from './composables/useAuth'
+import { useChat } from './composables/useChat'
+import { useConversations } from './composables/useConversations'
+import { useMemories } from './composables/useMemories'
 
-// ====================== 发送消息 + 流式接收 ======================
-async function sendMessage() {
-  // trim() 去掉首尾空格；空消息或正在等待回复时直接忽略，防止重复发送
-  const text = inputText.value.trim()
-  if (!text || loading.value) return
+const { user, restoring, isLoggedIn, login, restore, logout, clear } = useAuth()
+const conversations = useConversations()
+const memories = useMemories()
 
-  // 1. 把用户消息 push 进列表（界面立刻出现蓝色气泡）
-  //    注意：模板里用 v-for 遍历 messages，数组一变，Vue 的响应式系统自动重渲染
-  messages.value.push({ role: 'user', content: text })
-  inputText.value = ''  // 清空输入框
+const loginLoading = ref(false)
+const loginError = ref('')
+const loadingMessages = ref(false)
+const memoryOpen = ref(false)
+const chatInputRef = ref<InstanceType<typeof ChatInput>>()
 
-  // 2. 先放一条"空的助手消息"占位，后面收到 token 再逐段填充它的 content
-  //    （先 push 空消息，是为了让前端立刻显示"正在回复"的状态和光标）
-  messages.value.push({ role: 'assistant', content: '', toolInfo: [] })
-  // 【Vue 3 响应式关键点】必须从响应式数组里把这条消息"读出来"再操作：
-  //   messages 是 ref（深度响应式），直接 push 进去的原始对象并不受响应式管辖，
-  //   后面改它的 content 不会触发界面重渲染（要等 loading 变化才顺带刷出来，
-  //   表现就是"整段回答一下子出现"）。
-  //   从数组里取出来的是响应式代理，改它才会每来一个 token 就重渲染一次。
-  const assistantMsg: Message = messages.value[messages.value.length - 1]
-  loading.value = true
+/**
+ * 记忆抽取是流结束后的**后台任务**，接口返回 done 时它多半还没写完。
+ * 所以这里不立刻刷新，而是过几秒再拉一次，角标才会自然涨上去。
+ * 用户点开面板时还会再拉一次，双保险。
+ */
+let memoryTimer: number | undefined
 
-  try {
-    // 3. 调用后端流式接口
-    //    这里用相对路径 '/chat/stream'，浏览器会带上当前域名 localhost:5173，
-    //    由 vite.config.ts 里的 proxy 配置转发到后端 localhost:8000，
-    //    这样前端代码里不用写死后端地址，也没有跨域问题
-    const res = await fetch('/chat/stream', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },  // 告诉后端请求体是 JSON
-      body: JSON.stringify({
-        session_id: sessionId.value,
-        input: text,
-      }),
+function scheduleMemoryRefresh(): void {
+  window.clearTimeout(memoryTimer)
+  memoryTimer = window.setTimeout(() => {
+    void memories.refresh().catch(() => {
+      // 后台刷新失败无所谓，下次打开面板会重试
     })
+  }, 3000)
+}
 
-    // fetch 默认会把整个响应体收完才 resolve；对于流式响应，
-    // res.body 是一个 ReadableStream，可以边到边读，不用等结束
-    if (!res.body) throw new Error('响应体为空')
+// 每轮对话结束后刷新侧边栏，让新建会话的自动标题和时间排序即时生效
+const chat = useChat({
+  onFinished: () => {
+    void conversations.refresh()
+    scheduleMemoryRefresh()
+  },
+})
 
-    // 4. 读取流：getReader() 拿到读取器，read() 每次返回一到手的一个数据块
-    //    value 是 Uint8Array（二进制字节），用 TextDecoder 按 UTF-8 解码成字符串
-    const reader = res.body.getReader()
-    const decoder = new TextDecoder('utf-8')
-    let buffer = ''  // 缓冲区：网络分包不保证按消息边界切，半条消息要攒着
+/** 当前会话的标题（从侧边栏列表里取，保持与列表一致） */
+function currentTitle(): string {
+  const id = conversations.currentId.value
+  return conversations.items.value.find((item) => item.id === id)?.title ?? ''
+}
 
-    while (true) {
-      const { done, value } = await reader.read()  // 等待下一个数据块（Promise）
-      if (done) break  // 流关闭，退出循环
-
-      // stream: true 表示"可能还有后续字节"，避免多字节汉字被从中间截断
-      buffer += decoder.decode(value, { stream: true })
-
-      // 按 SSE 格式分割（以 \n\n 为分隔）
-      // 一条 SSE 消息的完整格式是 "data: {...}\n\n"，所以遇到空行就是一条完整消息
-      const lines = buffer.split('\n\n')
-      // pop() 取出最后一段：它可能是不完整的半条消息，留到下次数据到了再拼
-      // （已经完整的若干条留在 lines 里，进入下面逐个处理）
-      buffer = lines.pop() || ''
-
-      for (const line of lines) {
-        // 只处理 data: 开头的行（SSE 还支持 event:/id:/retry: 等字段，这里用不到）
-        if (!line.startsWith('data: ')) continue
-
-        // 去掉 "data: " 前缀（6 个字符），剩下的按 JSON 解析
-        const data = JSON.parse(line.slice(6))
-
-        if (data.type === 'token') {
-          // 文本内容：后端逐 token 推送，每来一片就追加到助手消息上（打字机效果）
-          assistantMsg.content += data.content
-          scrollToBottom()
-        } else if (data.type === 'tool_start') {
-          // 工具调用开始：在气泡里插一条工具状态行
-          assistantMsg.toolInfo?.push(data.content)
-        } else if (data.type === 'tool_end') {
-          // 工具调用结束：把工具返回值也展示出来
-          assistantMsg.toolInfo?.push(data.content)
-        } else if (data.type === 'error') {
-          // 后端推送的错误事件：把错误信息拼进消息里展示
-          assistantMsg.content += `\n❌ 错误：${data.content}`
-        } else if (data.type === 'done') {
-          // 流结束：什么都不用做，循环会自然结束
-        }
-      }
-    }
-  } catch (err: any) {
-    // fetch 本身失败（网络错误、代理不通、后端 500 等）会进这里，
-    // 而不是 SSE 的 error 事件（那是 HTTP 200 之后业务层的错误）
-    assistantMsg.content += `\n❌ 请求失败：${err.message}`
+/** 拉取当前会话的历史消息 */
+async function loadCurrent(): Promise<void> {
+  const id = conversations.currentId.value
+  if (!id) {
+    chat.clear()
+    return
+  }
+  loadingMessages.value = true
+  try {
+    await chat.load(id)
+  } catch {
+    // 会话不存在（别的标签页删了 / 超过 30 天被归档）时，退回空状态
+    chat.clear()
   } finally {
-    // 无论成功失败都要解除 loading（关闭"回复中..."和光标动画）
-    loading.value = false
-    scrollToBottom()
+    loadingMessages.value = false
   }
 }
 
-// ====================== 自动滚动到底部 ======================
-function scrollToBottom() {
-  // nextTick：等 Vue 把 DOM 更新完（消息刚 push 进数组时 DOM 还没渲染），
-  // 再把滚动条拉到最底，保证用户看到最新内容
-  nextTick(() => {
-    if (chatContainer.value) {
-      chatContainer.value.scrollTop = chatContainer.value.scrollHeight
-    }
+/** 登录成功后：拉列表 + 拉记忆 + 恢复上次打开的会话 */
+async function bootstrap(): Promise<void> {
+  await conversations.refresh()
+  // 记忆拉取失败不该拦住登录流程，用 catch 兜住
+  await memories.refresh().catch(() => {})
+  // refresh 可能把失效的 currentId 换成第一个会话，也可能变成 null
+  if (conversations.currentId.value) await loadCurrent()
+  else chat.clear()
+}
+
+async function handleLogin(payload: { username: string; password: string }): Promise<void> {
+  if (loginLoading.value) return
+  loginLoading.value = true
+  loginError.value = ''
+  try {
+    await login(payload.username, payload.password)
+    await bootstrap()
+  } catch (error) {
+    loginError.value = error instanceof Error ? error.message : '登录失败，请重试'
+  } finally {
+    loginLoading.value = false
+  }
+}
+
+function handleLogout(): void {
+  chat.stop()
+  chat.clear()
+  conversations.reset()
+  memories.reset()
+  memoryOpen.value = false
+  logout()
+}
+
+async function handleCreate(): Promise<void> {
+  chat.stop()
+  await conversations.create()
+  chat.clear()
+  chatInputRef.value?.focus()
+}
+
+async function handleSelect(id: string): Promise<void> {
+  if (id === conversations.currentId.value) return
+  // 切走时中断还在跑的流，避免回复写进另一个会话
+  chat.stop()
+  conversations.select(id)
+  await loadCurrent()
+}
+
+async function handleRename(id: string, title: string): Promise<void> {
+  await conversations.rename(id, title)
+}
+
+async function handleRemove(id: string): Promise<void> {
+  const target = conversations.items.value.find((item) => item.id === id)
+  const confirmed = window.confirm(`删除会话「${target?.title ?? ''}」？\n删除后不会再出现在列表里。`)
+  if (!confirmed) return
+
+  const wasCurrent = conversations.currentId.value === id
+  if (wasCurrent) chat.stop()
+
+  await conversations.remove(id)
+
+  if (wasCurrent) {
+    if (conversations.currentId.value) await loadCurrent()
+    else chat.clear()
+  }
+}
+
+async function handleClear(): Promise<void> {
+  const id = conversations.currentId.value
+  if (!id) return
+  if (!window.confirm('清空这段对话的所有消息？会话本身会保留。')) return
+
+  chat.stop()
+  await conversations.clearMessages(id)
+  chat.clear()
+}
+
+async function handleSend(text: string): Promise<void> {
+  // 还没选会话就自动建一个，省掉"先点新建再打字"这一步
+  let id = conversations.currentId.value
+  if (!id) {
+    const created = await conversations.create()
+    id = created.id
+  }
+  await chat.send(id, text)
+}
+
+/** 打开记忆面板时重新拉一次：用户点开就想看到最新的，不能是几秒前的缓存 */
+async function handleOpenMemories(): Promise<void> {
+  memoryOpen.value = true
+  await memories.refresh().catch(() => {})
+}
+
+async function handleRemoveMemory(id: number): Promise<void> {
+  await memories.remove(id)
+}
+
+async function handleClearMemories(): Promise<void> {
+  if (!window.confirm('清空全部记忆？\n之后 AI 不会再记得你的身份、偏好和背景信息。')) return
+  await memories.clearAll()
+}
+
+onMounted(async () => {
+  // 任何接口返回 401 都统一退回登录页，并清掉本地残留状态
+  onUnauthorized(() => {
+    chat.stop()
+    chat.clear()
+    conversations.reset()
+    memories.reset()
+    memoryOpen.value = false
+    clear()
   })
-}
 
-// ====================== 回车发送 ======================
-function handleKeydown(e: KeyboardEvent) {
-  // Enter 直接发送；Shift+Enter 是换行（e.shiftKey 判断Shift是否按下）
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault()  // 阻止 textarea 默认的换行行为
-    sendMessage()
-  }
-}
+  await restore()
+  if (isLoggedIn.value) await bootstrap()
+})
+
+onUnmounted(() => {
+  window.clearTimeout(memoryTimer)
+})
 </script>
 
 <template>
-  <!-- 整体布局：flex 纵向排列——头部 / 消息列表（占满剩余高度）/ 输入区 -->
-  <div class="chat-app">
-    <!-- 顶部标题栏 -->
-    <header class="header">
-      <h1>LangChain Agent 流式对话</h1>
-      <!-- slice(-8) 只显示 session ID 后 8 位，避免太长 -->
-      <span class="session-id">Session: {{ sessionId.slice(-8) }}</span>
-    </header>
+  <div v-if="restoring" class="boot">正在恢复登录状态…</div>
 
-    <!-- 消息列表：v-for 按索引遍历，:key="idx" 帮 Vue 高效 diff -->
-    <div ref="chatContainer" class="chat-container">
-      <!-- 空状态提示：一条消息都没有时显示 -->
-      <div v-if="messages.length === 0" class="empty-hint">
-        <p>👋 你好！我是你的 AI 助手</p>
-        <p class="tip">试试问我：现在几点？或者帮我算一下 1024 * 8</p>
-      </div>
+  <LoginView
+    v-else-if="!isLoggedIn || !user"
+    :loading="loginLoading"
+    :error="loginError"
+    @submit="handleLogin"
+  />
 
-      <!-- v-for 按索引遍历消息数组，:key 帮 Vue 高效 diff；
-           :class="msg.role" 让用户/助手用两种气泡样式 -->
-      <div
-        v-for="(msg, idx) in messages"
-        :key="idx"
-        class="message"
-        :class="msg.role"
-      >
-        <div class="avatar">{{ msg.role === 'user' ? '🧑' : '🤖' }}</div>
-        <div class="bubble">
-          <!-- 工具调用信息：v-if 控制有无；有调用时才显示橙色状态区 -->
-          <div v-if="msg.toolInfo && msg.toolInfo.length > 0" class="tool-info">
-            <div v-for="(tool, i) in msg.toolInfo" :key="i" class="tool-line">
-              {{ tool }}
-            </div>
-          </div>
-          <!-- 文本内容：white-space: pre-wrap 保留换行 -->
-          <div class="content">{{ msg.content }}</div>
-          <!-- 流式输出中的光标：只有最后一条助手消息 + loading 时才闪烁 -->
-          <span v-if="loading && idx === messages.length - 1 && msg.role === 'assistant'" class="cursor">▋</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- 输入框 -->
-    <div class="input-area">
-    <!-- 输入框：v-model 双向绑定（输入自动同步到 inputText）；
-         @keydown 处理回车发送；等待回复时 :disabled 禁止输入 -->
-    <textarea
-      v-model="inputText"
-      @keydown="handleKeydown"
-      placeholder="输入消息，Enter 发送，Shift+Enter 换行"
-      :disabled="loading"
-      rows="2"
+  <div v-else class="app-shell">
+    <SessionSidebar
+      :conversations="conversations.items.value"
+      :current-id="conversations.currentId.value"
+      :user="user"
+      :loading="conversations.loading.value"
+      @create="handleCreate"
+      @select="handleSelect"
+      @rename="handleRename"
+      @remove="handleRemove"
+      @logout="handleLogout"
     />
-      <button @click="sendMessage" :disabled="loading || !inputText.trim()">
-        {{ loading ? '回复中...' : '发送' }}
-      </button>
-    </div>
+
+    <main class="main">
+      <ChatWindow
+        :title="currentTitle()"
+        :messages="chat.messages.value"
+        :has-conversation="Boolean(conversations.currentId.value)"
+        :loading="loadingMessages"
+        :memory-count="memories.items.value.length"
+        @clear="handleClear"
+        @open-memories="handleOpenMemories"
+      />
+      <ChatInput
+        ref="chatInputRef"
+        :disabled="chat.sending.value"
+        :placeholder="
+          conversations.currentId.value
+            ? '输入消息，Enter 发送，Shift+Enter 换行'
+            : '输入消息，会自动新建一个会话'
+        "
+        @send="handleSend"
+      />
+    </main>
+
+    <!-- 记忆面板自己 Teleport 到 body，放在这里只是为了就近管理状态 -->
+    <MemoryPanel
+      :open="memoryOpen"
+      :memories="memories.items.value"
+      :loading="memories.loading.value"
+      @close="memoryOpen = false"
+      @remove="handleRemoveMemory"
+      @clear="handleClearMemories"
+    />
   </div>
 </template>
 
 <style scoped>
-/* scoped 表示这些样式只作用于本组件，不会污染全局 */
-
-.chat-app {
+.boot {
   display: flex;
-  flex-direction: column;   /* 纵向排列：header / container / input-area */
-  height: 100vh;            /* 占满整个视口高度 */
-  max-width: 800px;         /* 内容区最大宽度，居中更像聊天软件 */
-  margin: 0 auto;
-  background: #f5f5f5;
-}
-
-.header {
-  display: flex;
-  justify-content: space-between;  /* 标题左、Session 右 */
   align-items: center;
-  padding: 16px 20px;
-  background: #fff;
-  border-bottom: 1px solid #e0e0e0;
-}
-.header h1 {
-  font-size: 18px;
-  margin: 0;
-}
-.session-id {
-  font-size: 12px;
+  justify-content: center;
+  height: 100vh;
+  font-size: 14px;
   color: #999;
 }
 
-.chat-container {
-  flex: 1;               /* 占满 header 和 input-area 之外的剩余高度 */
-  overflow-y: auto;      /* 消息多了出现滚动条（配合 scrollToBottom 自动滚底） */
-  padding: 20px;
-}
-
-.empty-hint {
-  text-align: center;
-  margin-top: 80px;
-  color: #666;
-}
-.empty-hint .tip {
-  font-size: 14px;
-  color: #999;
-  margin-top: 8px;
-}
-
-.message {
+.app-shell {
   display: flex;
-  margin-bottom: 16px;
-  gap: 10px;  /* 头像和气泡之间的间距 */
-}
-.message.user {
-  flex-direction: row-reverse;  /* 用户消息：头像移到右边 */
-}
-
-.avatar {
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;      /* 正圆头像 */
-  background: #e0e0e0;
-  display: flex;
-  align-items: center;
-  justify-content: center; /* emoji 居中 */
-  font-size: 18px;
-  flex-shrink: 0;          /* 窄屏时不被压缩 */
-}
-
-.bubble {
-  max-width: 70%;          /* 气泡最宽占行宽 70%，长文本自动换行 */
-  padding: 10px 14px;
-  border-radius: 12px;
+  height: 100vh;
   background: #fff;
-  line-height: 1.6;
-  white-space: pre-wrap;   /* 保留文本里的换行和空格 */
-  word-break: break-word;  /* 长单词/URL 强制断行，防止溢出 */
-}
-.message.user .bubble {
-  background: #007aff;     /* 用户气泡蓝色 */
-  color: #fff;
 }
 
-/* 工具调用状态区：橙黄色底，和正文区分 */
-.tool-info {
-  font-size: 12px;
-  color: #ff9500;
-  background: #fff8e6;
-  padding: 6px 8px;
-  border-radius: 6px;
-  margin-bottom: 8px;
-}
-.tool-line {
-  margin: 2px 0;
-}
-
-/* 流式输出光标：闪烁动画，模拟"正在打字" */
-.cursor {
-  animation: blink 1s infinite;
-  color: #007aff;
-}
-@keyframes blink {
-  0%, 50% { opacity: 1; }    /* 0~50% 可见 */
-  51%, 100% { opacity: 0; }  /* 51%~100% 隐藏，形成闪烁 */
-}
-
-.input-area {
+.main {
+  flex: 1;
   display: flex;
-  gap: 10px;
-  padding: 16px 20px;
-  background: #fff;
-  border-top: 1px solid #e0e0e0;
-}
-.input-area textarea {
-  flex: 1;                  /* 输入框占满按钮之外的宽度 */
-  padding: 10px 12px;
-  border: 1px solid #ddd;
-  border-radius: 8px;
-  resize: none;             /* 禁止手动拖拽改变大小（用 rows 固定 2 行） */
-  font-size: 14px;
-  outline: none;            /* 去掉聚焦时的默认蓝框 */
-}
-.input-area textarea:focus {
-  border-color: #007aff;    /* 聚焦时边框变蓝 */
-}
-.input-area button {
-  padding: 0 24px;
-  border: none;
-  border-radius: 8px;
-  background: #007aff;
-  color: #fff;
-  font-size: 14px;
-  cursor: pointer;
-}
-.input-area button:disabled {
-  background: #ccc;         /* 禁用态灰色 */
-  cursor: not-allowed;
+  flex-direction: column;
+  min-width: 0; /* 防止长内容把 flex 容器撑破 */
+  min-height: 0;
+  background: #f7f8fa;
 }
 </style>
