@@ -19,11 +19,14 @@ const props = defineProps<{
   loading: boolean
   /** 当前用户已积累的长期记忆条数，显示在按钮角标上 */
   memoryCount: number
+  /** 知识库里可检索的文档数，显示在按钮角标上 */
+  knowledgeCount: number
 }>()
 
 const emit = defineEmits<{
   (e: 'clear'): void
   (e: 'open-memories'): void
+  (e: 'open-knowledge'): void
 }>()
 
 const scrollRef = ref<HTMLElement>()
@@ -71,10 +74,20 @@ watch(
       <h1>{{ hasConversation ? title : 'LangChain Agent' }}</h1>
 
       <div class="actions">
-        <!-- 记忆按钮常驻：它是全局的，不依赖当前有没有会话 -->
+        <!-- 记忆和知识库按钮都常驻：它们是全局的，不依赖当前有没有会话 -->
         <button type="button" class="mem-btn" title="查看 AI 记住了什么" @click="emit('open-memories')">
           🧠 记忆
           <span v-if="memoryCount > 0" class="badge">{{ memoryCount }}</span>
+        </button>
+
+        <button
+          type="button"
+          class="mem-btn"
+          title="上传资料，让 AI 基于文档回答"
+          @click="emit('open-knowledge')"
+        >
+          📚 知识库
+          <span v-if="knowledgeCount > 0" class="badge">{{ knowledgeCount }}</span>
         </button>
 
         <button

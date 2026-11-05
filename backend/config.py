@@ -100,6 +100,75 @@ class Settings:
     # 抽取时把这轮对话提交给模型的字符预算
     MEMORY_SOURCE_CLIP: int = _int("MEMORY_SOURCE_CLIP", 3000)
 
+    # ---------- P2：向量化（embedding） ----------
+    # 当前接的是硅基流动的 bge-m3：1024 维，中文效果够用。
+    #
+    # 换服务商只需要改这四个值，代码不用动：
+    #   智谱 BigModel   BASE_URL=https://open.bigmodel.cn/api/paas/v4
+    #                   MODEL=embedding-3  DIM=1024  DIMENSIONS=1024
+    #                   （模型默认输出 2048 维，超过 pgvector 的 HNSW 上限 2000，
+    #                     必须用 dimensions 参数压到 1024，否则索引建不起来）
+    #   阿里百炼         BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+    #                   MODEL=text-embedding-v3  DIM=1024
+    EMBED_API_KEY: str = os.getenv("EMBED_API_KEY", "")
+    EMBED_BASE_URL: str = os.getenv("EMBED_BASE_URL", "https://api.siliconflow.cn/v1")
+    EMBED_MODEL: str = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
+    EMBED_DIM: int = _int("EMBED_DIM", 1024)
+    # 请求时显式指定输出维度，0 表示不传这个字段。
+    #
+    # 为什么需要它：部分模型支持"按需输出维度"（OpenAI text-embedding-3、
+    # 智谱 embedding-3 都是），默认维度往往很大（2048 / 3072），
+    # 而 pgvector 的 HNSW 索引只到 2000 维。压到 1024 后既能用索引，
+    # 存储和传输也省一半，检索质量在中文场景几乎无差异。
+    # 不支持的模型（比如 bge-m3）保持 0，避免多传字段被拒。
+    EMBED_DIMENSIONS: int = _int("EMBED_DIMENSIONS", 0)
+    # 单次请求带多少段文本。硅基流动 bge-m3 的单批上限是 32，这里留余量
+    EMBED_BATCH_SIZE: int = _int("EMBED_BATCH_SIZE", 16)
+    EMBED_TIMEOUT: float = _float("EMBED_TIMEOUT", 30.0)
+
+    # ---------- P2：知识库（RAG） ----------
+    RAG_ENABLED: bool = _bool("RAG_ENABLED", True)
+    # 上传文件大小上限。超过直接拒，不进入解析流程
+    UPLOAD_MAX_BYTES: int = _int("UPLOAD_MAX_BYTES", 5 * 1024 * 1024)
+    # 抽取出的正文上限。防止一个巨型 PDF 把后台向量化任务拖到几分钟
+    DOCUMENT_MAX_CHARS: int = _int("DOCUMENT_MAX_CHARS", 200_000)
+    # 切片长度与重叠。500 字大约对应 300~500 token，是检索粒度与上下文完整性的折中
+    CHUNK_SIZE: int = _int("CHUNK_SIZE", 500)
+    CHUNK_OVERLAP: int = _int("CHUNK_OVERLAP", 80)
+    # 一次检索返回几段
+    RAG_TOP_K: int = _int("RAG_TOP_K", 5)
+    # 相似度低于这个值的结果丢掉。
+    #
+    # 0.45 是拿 bge-m3 实测出来的，两组数据：
+    #
+    # 1) 句子级对照（12 组）
+    #    无关对 "红烧肉要炖多久" vs "Vite 预构建机制"：0.237 ~ 0.414，均值 0.337
+    #    相关对 "构建优化怎么做的" vs "预构建缓存持久化…"：0.538 ~ 0.812，均值 0.639
+    #    初版配的 0.35 压在无关区间 80 分位上，"唐诗三百首"这类内容会被当成资料塞进上下文。
+    #
+    # 2) 真实文档检索（一份 4 章节笔记，17 个查询，Top-1 命中 10/10）
+    #    正确命中的最低分是 0.4900（"shadow DOM 用来干什么"、"炒糖色用什么火"），
+    #    但同一文档里邻近章节作噪声时最高能到 0.5789。
+    #    两者区间重叠，说明**阈值挡不住"同文档里相邻但不对题"的片段**。
+    #
+    # 所以要认清这个参数的职责：它只负责挡掉"完全离题"的问题
+    # （"今天天气怎么样"、"公司年假有几天"，实测返回空），
+    # 文档内部的排序交给 top-k 和模型自己判断，别指望阈值解决。
+    # 也因此**不能**调到 0.5：那条线会先筛掉两条正确答案，噪声照样进得来。
+    #
+    # 这个值**与模型强相关**，不能跨模型照抄：
+    #   bge-m3 的分布整体偏高且压缩（无关也有 0.33），
+    #   有些模型无关文本只有 0.05，用 0.45 会把正确结果全筛掉。
+    #   换 embedding 模型必须重新实测，方法见 README「换向量模型」。
+    RAG_MIN_SCORE: float = _float("RAG_MIN_SCORE", 0.45)
+    # 工具返回给模型的检索结果总字符预算，防止一次塞爆上下文
+    RAG_TOOL_MAX_CHARS: int = _int("RAG_TOOL_MAX_CHARS", 3000)
+
+    # ---------- P2：记忆向量召回 ----------
+    # 记忆条数超过 MEMORY_TOP_K 之后，事实类改为按语义相似度召回。
+    # 偏好类永远全量注入，理由见 services/memory.load_for_prompt
+    MEMORY_VECTOR_RECALL: bool = _bool("MEMORY_VECTOR_RECALL", True)
+
     # ---------- 会话生命周期 ----------
     # 列表只展示最近 N 天有更新的会话
     CONVERSATION_LIST_DAYS: int = _int("CONVERSATION_LIST_DAYS", 30)

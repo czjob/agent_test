@@ -18,6 +18,7 @@ L3 长期记忆：从对话里抽取"关于用户本人"的稳定信息，跨会
 
 import json
 import logging
+import math
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
 from db import SessionLocal
+from embeddings import EmbeddingError, embeddings
 from llm import llm
 from models import MEMORY_KINDS, Memory, Message
 
@@ -223,9 +225,22 @@ async def extract_from_turn(
                 candidates = [c for c in candidates if c["content"] not in dismissed]
 
             if not candidates:
+                # 这轮没抽到新记忆，但历史遗留的空向量仍要补。
+                #
+                # 踩过的坑：这一行原来放在判断之后，结果向量服务是后来才配好的，
+                # 之前写入的 6 条记忆一直是 embedding IS NULL，
+                # 而后续几轮对话都没产生新记忆（用户只是在问文档内容），
+                # 回填永远进不去——语义召回对这批老数据彻底失效，日志里毫无痕迹。
+                # 回填本身很便宜：只是一条 SELECT，没有待补的行就直接返回。
+                await _backfill_embeddings(db, user_id)
                 return
 
             await _upsert_memories(db, user_id, conversation_id, candidates)
+
+            # 新写入的记忆还没有向量。补向量放在这里而不是写入时同步做：
+            # 同步做会让"UNIQUE 冲突 → 无需更新"的那批也白花一次 embedding 调用，
+            # 而这里查的是 embedding IS NULL，天然只处理真正需要的那几条。
+            await _backfill_embeddings(db, user_id)
 
             logger.info(
                 "会话 %s 记忆抽取完成：候选 %s 条", conversation_id, len(candidates)
@@ -275,9 +290,23 @@ async def _upsert_memories(
     await db.commit()
 
 
-async def load_for_prompt(db: AsyncSession, user_id: uuid.UUID) -> list[Memory]:
+async def load_for_prompt(
+    db: AsyncSession, user_id: uuid.UUID, query: str | None = None
+) -> list[Memory]:
     """
-    取出要注入系统提示的记忆，按重要度倒序。
+    取出要注入系统提示的记忆。
+
+    P2 的变化：记忆多起来之后不再全量注入，而是按语义相关度挑选。
+    但这里有两个刻意的例外，都是踩过坑之后定下来的：
+
+    1. 偏好（preference）永远全量注入，不参与相似度筛选。
+       "回答简洁"和"什么是虚拟 DOM"在语义上没有半点相似性，
+       按相似度筛一定会把它筛掉，然后 P1 那个"偏好不生效"的问题就原地复活。
+       偏好本来就没几条（都是对输出形式的要求），全带上的成本可以忽略。
+
+    2. 记忆总量没超过 MEMORY_TOP_K 时，完全不走向量，按重要度取。
+       这既是省一次 embedding 调用（省 200~500ms 首字延迟），
+       也是因为"全量就是最准的召回"——没必要为了用向量而用向量。
 
     返回 ORM 对象而不是纯文本：上层要按 kind 分组注入
     （偏好是硬约束，事实只是背景，两者在 prompt 里的措辞不同），
@@ -300,7 +329,9 @@ async def load_for_prompt(db: AsyncSession, user_id: uuid.UUID) -> list[Memory]:
                     Memory.dismissed_at.is_(None),
                 )
                 .order_by(Memory.importance.desc(), Memory.created_at.desc())
-                .limit(settings.MEMORY_TOP_K)
+                # 上限放宽到 TOP_K 的十倍：候选太少的话向量召回没有意义。
+                # 这个数只是防止极端情况下把整张表拉进内存，正常用户到不了
+                .limit(max(settings.MEMORY_TOP_K * 10, 100))
             )
         ).all()
     )
@@ -308,15 +339,142 @@ async def load_for_prompt(db: AsyncSession, user_id: uuid.UUID) -> list[Memory]:
     if not rows:
         return []
 
+    # 先结束这条读查询的事务，再去调 embedding。
+    # 网络调用（200~800ms）期间如果还挂着事务，等于占着连接在等外网，
+    # 连接池只有 5 个常驻，几个人同时说话就会开始排队。
+    # expire_on_commit=False 保证 commit 之后这些对象的属性依然可读。
+    await db.commit()
+
+    query_vector = await _maybe_embed_query(query, len(rows))
+    selected = _select_for_prompt(rows, query_vector)
+
+    if not selected:
+        return []
+
     # 一条 UPDATE 刷新全部命中项，不做逐条更新
     await db.execute(
         update(Memory)
-        .where(Memory.id.in_([row.id for row in rows]))
+        .where(Memory.id.in_([row.id for row in selected]))
         .values(last_used_at=datetime.now(timezone.utc))
     )
     await db.commit()
 
-    return rows
+    return selected
+
+
+async def _maybe_embed_query(query: str | None, total: int) -> list[float] | None:
+    """
+    只有"确实要用向量召回"时才去调 embedding 接口。
+
+    这个if 判断看着啰嗦，但它决定了日常对话的首字延迟：
+    记忆只有十几条时（绝大多数情况），这里直接返回 None，一毫秒都不多花。
+    """
+    if not settings.MEMORY_VECTOR_RECALL:
+        return None
+    if total <= settings.MEMORY_TOP_K:
+        return None
+    if not query or not embeddings.available:
+        return None
+    return await embeddings.embed_one(query)
+
+
+def _select_for_prompt(rows: list[Memory], query_vector: list[float] | None) -> list[Memory]:
+    """
+    在候选里挑出最终注入的那批。
+
+    抽成独立的纯函数是为了能直接拿假数据验证"偏好一定被选中"这条规则，
+    不必起数据库也不用 mock 网络。
+
+    为什么余弦相似度在这里手算，而不像 chunk 检索那样交给数据库：
+      memories 的候选是几十条，一次全量拉回来已经发生了，在内存里算比再发
+      一条带 JOIN 的 SQL 更简单；而且这里要做"偏好全量 + 其余按相似度"的混合逻辑，
+      用 SQL 表达要么写 UNION，要么分两次查询再合并，可读性反而更差。
+      数据量到几万条时才值得换回数据库算。
+    """
+    limit = settings.MEMORY_TOP_K
+
+    if query_vector is None:
+        # 按重要度取前 N 条（rows 已经排好序）
+        return rows[:limit]
+
+    preferences = [row for row in rows if row.kind == "preference"]
+    others = [row for row in rows if row.kind != "preference"]
+
+    # 偏好优先占用名额。偏好条数一般远小于 TOP_K，真超了就只保留最重要的那几条
+    keep_ids = {row.id for row in preferences[:limit]}
+    remaining = limit - len(keep_ids)
+
+    if remaining > 0:
+        scored = [
+            (row, _cosine(query_vector, row.embedding))
+            for row in others
+            # 还没向量化的（老数据 / 上次服务不可用）不参与打分，
+            # 但它们不该直接消失，所以下面把它们按重要度补进来
+            if row.embedding is not None
+        ]
+        scored.sort(key=lambda item: item[1], reverse=True)
+        keep_ids.update(row.id for row, _score in scored[:remaining])
+
+        # 名额没填满（比如大部分记忆都没向量）时，用重要度补位。
+        # 不补的话会出现"记忆明明存在，模型却完全不知道"的诡异现象
+        if len(keep_ids) < limit:
+            for row in others:
+                if len(keep_ids) >= limit:
+                    break
+                keep_ids.add(row.id)
+
+    # 按原始顺序（重要度倒序）返回，保证同一批记忆每次拼出来的 prompt 一致
+    return [row for row in rows if row.id in keep_ids]
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    """余弦相似度。手写而不是引 numpy：只为几十条 1024 维向量引入一个科学计算库不值。"""
+    if len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+async def _backfill_embeddings(db: AsyncSession, user_id: uuid.UUID, limit: int = 50) -> None:
+    """
+    给还没向量化的记忆补向量。
+
+    失败只告警不抛：向量服务不可用时，记忆依然按重要度正常注入，
+    只是暂时享受不到语义召回。这是"可选增强"该有的降级姿势。
+    """
+    if not embeddings.available:
+        return
+
+    rows = list(
+        (
+            await db.scalars(
+                select(Memory)
+                .where(
+                    Memory.user_id == user_id,
+                    Memory.embedding.is_(None),
+                    Memory.dismissed_at.is_(None),
+                )
+                .order_by(Memory.created_at.desc())
+                .limit(limit)
+            )
+        ).all()
+    )
+    if not rows:
+        return
+
+    try:
+        vectors = await embeddings.embed([row.content for row in rows])
+    except EmbeddingError as exc:
+        logger.warning("记忆向量化失败，本次跳过（不影响记忆注入）：%s", exc)
+        return
+
+    for row, vector in zip(rows, vectors):
+        row.embedding = vector
+    await db.commit()
 
 
 # ====================== 记忆面板 ======================

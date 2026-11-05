@@ -17,7 +17,7 @@ const BACKEND = 'http://127.0.0.1:8000'
  * 漏配的症状很隐蔽：请求不会被转发，而是命中 Vite 的 SPA fallback 返回 index.html，
  * 前端拿到一坨 HTML 去 res.json()，报的是 JSON 解析错误，完全看不出是代理的问题。
  */
-const API_PREFIXES = ['/auth', '/conversations', '/chat', '/memories']
+const API_PREFIXES = ['/auth', '/conversations', '/chat', '/memories', '/documents']
 
 export default defineConfig({
   plugins: [vue()], // Vue 单文件组件（.vue）插件：让 Vite 能解析 <script setup> 等语法

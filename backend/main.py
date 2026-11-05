@@ -18,7 +18,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import settings
 from background import drain
 from db import SessionLocal, engine, init_schema
-from routers import auth, chat, conversations, memories
+from embeddings import embeddings
+from routers import auth, chat, conversations, documents, memories
 from seed import seed_users
 from services import memory as memory_service
 from services.conversation import run_retention_cleanup
@@ -75,9 +76,13 @@ async def lifespan(app: FastAPI):
 
     cleanup_task.cancel()
 
-    # 等后台任务收尾：摘要压缩、记忆抽取可能正在写库，
+    # 等后台任务收尾：摘要压缩、记忆抽取、文档向量化可能正在写库，
     # 直接关事件循环会把它们硬中断。带超时，避免服务关不掉。
     await drain(timeout=10.0)
+
+    # 释放向量客户端的连接池。放在 drain 之后：
+    # 正在跑的文档向量化任务还要用这个客户端，先关会报 "client has been closed"
+    await embeddings.close()
 
     await engine.dispose()
 
@@ -96,6 +101,7 @@ app.include_router(auth.router)
 app.include_router(conversations.router)
 app.include_router(chat.router)
 app.include_router(memories.router)
+app.include_router(documents.router)
 
 
 @app.get("/")

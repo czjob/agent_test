@@ -19,11 +19,23 @@ ORM 模型：users / conversations / messages / memories
 4. 摘要和消息原文并存
    summary 是 L2 压缩的产物，summary_until_seq 记录"摘要覆盖到哪条消息"。
    原文永远不删——用户要往前翻看完整历史；摘要只影响喂给模型的那份上下文。
+
+5. 向量列的维度在 DDL 里写死
+   pgvector 的 vector(N) 是强类型，建表那一刻维度就固定了。
+   这带来一个必须接受的约束：换 embedding 模型（比如 bge-m3 的 1024 维换成
+   智谱 embedding-3 的 2048 维）不能只改配置，得 ALTER 列类型并重建索引。
+   所以 EMBED_DIM 是一个"改之前先想清楚"的配置，不是随便调的参数。
+
+6. chunks 冗余存 user_id
+   检索时本来可以 join documents 再按 user_id 过滤，但那样权限条件就不在
+   chunks 这张被扫描的表上了。冗余一列，越权防线就能直接写在主查询的 WHERE 里，
+   和会话接口保持一致：归属校验放在 SQL，不放在 Python。
 """
 
 import uuid
 from datetime import datetime
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     DateTime,
@@ -40,6 +52,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
+from config import settings
 from db import Base
 
 # 新会话的默认标题。前端判断"是否需要自动生成标题"时也用这个值。
@@ -193,3 +206,98 @@ class Memory(Base):
     #
     #   这行数据本身没有保留价值，所以清理任务会定期物理删除 30 天前的记录。
     dismissed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # 语义向量（P2）。为空表示这条记忆还没向量化：
+    #   - 老数据：P1 时期写入的记忆
+    #   - 向量服务当时不可用：降级为按重要度注入，不影响记忆本身可用
+    # 补向量的时机是"每次抽取落库之后"，见 services/memory._backfill_embeddings。
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(settings.EMBED_DIM), nullable=True
+    )
+
+
+class Document(Base):
+    """
+    知识库文档。用户上传的一份资料，切分后进入 chunks 表参与检索。
+
+    为什么把全文存在数据库里，而不是丢到 uploads/ 目录：
+      1. 检索只用得到文本，原始二进制没有第二处消费方；
+      2. 文件系统和数据库的一致性是白送的 bug 来源——删了记录文件还在，
+         或者反过来，备份时两边要分别处理；
+      3. 存全文让"重新切分"成为可能：将来调 CHUNK_SIZE 可以直接重跑，
+         不必要求用户重新上传。
+      代价是数据库会变大，几百份文档的量级完全在可接受范围。
+    """
+
+    __tablename__ = "documents"
+    __table_args__ = (
+        # 列表页查询：某用户 + 按时间倒序
+        Index("ix_documents_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    # 不单独加 index=True：下面的 (user_id, created_at) 联合索引前缀已经覆盖了
+    # "按 user_id 过滤"这一半，再建一个单列索引只会拖慢写入、多占一份空间。
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    # 小写扩展名（含点），如 ".pdf"。单独存一列是为了列表页展示图标不必再解析文件名
+    ext: Mapped[str] = mapped_column(String(16), default="", nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # 解析出来的纯文本，以及它的字符数（列表页直接展示，不用每次算 length）
+    content: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    char_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # pending / processing / ready / failed
+    # 存字符串而不是枚举：新增状态不用 ALTER TYPE，和 memories.kind 的处理保持一致
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    # 失败原因。截断后存，供前端直接展示，省得用户去看服务端日志
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class Chunk(Base):
+    """
+    文档切片。检索的最小单位，一行对应一段带向量的文本。
+
+    为什么切片要单独一张表而不是往 documents 里塞数组：
+      检索是"在一堆向量里找最近的 k 个"，需要按行建向量索引。
+      塞进数组就得在应用层全量拉出来算，等于自己实现一遍向量检索。
+    """
+
+    __tablename__ = "chunks"
+    __table_args__ = (
+        # 检索的 WHERE 是 user_id + 距离排序，这个索引兜住前一半条件。
+        # 向量索引（HNSW）不在这里定义：它依赖 pgvector 版本和列维度，
+        # 用 db.py 里的显式 DDL 创建更好控制，也方便给老库补。
+        Index("ix_chunks_user", "user_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        # 删文档时切片跟着删。没有独立存在的意义，物理级联最干净
+        ForeignKey("documents.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    # 冗余用户 id，理由见文件头第 6 条。
+    # 不单独加 index=True：__table_args__ 里已经有同名含义的 ix_chunks_user
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+
+    # 在文档内的顺序，用于展示"第几段"以及将来做上下文扩展（取相邻段）
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(settings.EMBED_DIM), nullable=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

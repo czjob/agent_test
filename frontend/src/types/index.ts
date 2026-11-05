@@ -85,3 +85,26 @@ export interface Memory {
   /** 最近一次被注入到对话里的时间。null 表示还没用过 */
   last_used_at: string | null
 }
+
+/**
+ * 知识库文档的处理状态。
+ *
+ * 上传接口是异步的：解析完立刻返回 pending，切分和向量化在后台跑。
+ * 前端靠轮询 status 判断什么时候能开始提问。
+ */
+export type DocumentStatus = 'pending' | 'processing' | 'ready' | 'failed'
+
+export interface KnowledgeDocument {
+  id: string
+  filename: string
+  ext: string
+  size_bytes: number
+  /** 解析出的正文字数（超长文档会被后端截断） */
+  char_count: number
+  /** 切出的片段数。ready 之后才有值 */
+  chunk_count: number
+  status: DocumentStatus
+  /** 仅 failed 时有值，直接展示给用户，省得去翻后端日志 */
+  error: string | null
+  created_at: string
+}

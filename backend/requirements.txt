@@ -14,3 +14,13 @@ asyncpg>=0.29
 # ===== 认证 =====
 pyjwt>=2.8
 pwdlib[argon2]>=0.2
+
+# ===== P2：向量检索（RAG） =====
+# pgvector 的 Python 包：提供 SQLAlchemy 的 Vector 类型和余弦距离算子
+pgvector>=0.2.5
+# 调 embedding 接口。不套 openai SDK，直接用 HTTP
+httpx>=0.27
+# 文件上传（multipart/form-data）解析。缺了它 FastAPI 启动时就会报错
+python-multipart>=0.0.9
+# PDF 文字提取。可选——不装也能跑，只是上传 PDF 时会提示不支持
+pypdf>=4.0

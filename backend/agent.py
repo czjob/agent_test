@@ -174,8 +174,12 @@ async def stream_agent(
                 # 模型幻觉出不存在的工具：不崩溃，把错误作为结果回传，它通常会自我纠正
                 result = f"错误：工具 {tool_name} 不存在"
             else:
-                # 工具内部已 try 兜底，不会抛异常；同步函数很快，直接调用即可
-                result = str(tool.invoke(tool_args))
+                # 用 ainvoke 而不是 invoke：
+                #   P2 的 search_knowledge_base 是 async 的（要查数据库 + 调向量接口），
+                #   在事件循环里直接 invoke 它只会拿到一个未 await 的协程对象。
+                #   ainvoke 对同步工具也兼容——langchain 会把它们丢到线程池执行，
+                #   所以 calculate / get_current_time 一行都不用改。
+                result = str(await tool.ainvoke(tool_args))
 
             yield AgentEvent("tool_end", f"✅ 工具返回：{result}")
 

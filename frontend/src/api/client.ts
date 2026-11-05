@@ -67,7 +67,30 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
     ...init,
     headers: buildHeaders(init.headers),
   })
+  return handleResponse<T>(res)
+}
 
+/**
+ * 上传文件（multipart/form-data）。
+ *
+ * 为什么不复用 api.post：
+ *   那个函数会强制设 Content-Type: application/json。
+ *   上传必须让浏览器自己生成 `multipart/form-data; boundary=...`，
+ *   手工设置 Content-Type 会丢掉 boundary，后端解析出来是空的。
+ *
+ * 鉴权和错误处理仍然复用同一套，否则上传接口就成了 401 处理的漏洞。
+ */
+export async function upload<T>(path: string, form: FormData): Promise<T> {
+  const headers = new Headers()
+  const token = getToken()
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+
+  const res = await fetch(path, { method: 'POST', body: form, headers })
+  return handleResponse<T>(res)
+}
+
+/** 统一的响应处理：401 清理登录态、非 2xx 抛 ApiError、204 返回 undefined */
+async function handleResponse<T>(res: Response): Promise<T> {
   if (res.status === 401) {
     setToken(null)
     unauthorizedHandler?.()

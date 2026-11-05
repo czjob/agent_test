@@ -97,3 +97,30 @@ class MemoryOut(BaseModel):
 
 class ClearMemoryResponse(BaseModel):
     deleted: int = Field(description="本次清掉的记忆条数")
+
+
+# ====================== 知识库 ======================
+class DocumentOut(BaseModel):
+    """
+    知识库列表项。
+
+    不含 content（全文）——列表页用不上，一段几百 KB 的正文会把列表接口撑得很大。
+    需要全文是"重新切分"那种运维场景，走服务端内部逻辑，不经过这个接口。
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    filename: str
+    ext: str
+    size_bytes: int
+    char_count: int = Field(description="解析出的正文字数（已截断后的实际入库长度）")
+    chunk_count: int = Field(description="切分出的片段数，ready 之后才有值")
+    status: str = Field(description="pending / processing / ready / failed")
+    error: str | None = Field(default=None, description="失败原因，仅 failed 时有值")
+    created_at: datetime
+
+
+class ReindexResponse(BaseModel):
+    id: uuid.UUID
+    status: str = Field(description="重置后的状态，正常是 pending")

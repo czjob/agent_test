@@ -1,15 +1,18 @@
 """
 流式对话接口（SSE）。
 
-这个文件是"持久化"、"记忆"和"Agent"三件事的交汇点，核心职责：
+这个文件是"持久化"、"记忆"、"RAG"和"Agent"四件事的交汇点，核心职责：
   1. 校验会话归属，把用户消息先落库（即使用户中途断开也不丢）
   2. 从数据库读上下文（L2 摘要 + 未压缩区的原文）和长期记忆（L3）
-  3. 调用 agent.stream_agent 拿到事件流，边收边推 SSE
-  4. 流结束后开一个**新的** session 把本轮产生的消息落库
-  5. 流结束后触发两个后台任务：L2 摘要压缩、L3 记忆抽取
+  3. 把当前用户身份注入工具上下文（RAG 工具靠它做权限过滤）
+  4. 调用 agent.stream_agent 拿到事件流，边收边推 SSE
+  5. 流结束后开一个**新的** session 把本轮产生的消息落库
+  6. 流结束后触发两个后台任务：L2 摘要压缩、L3 记忆抽取
 
 关于数据库连接：整条流式过程中不持有任何数据库连接。
 准备阶段用完立刻释放，落库阶段重新取连接，避免长连接占满连接池。
+P2 的检索工具是例外——它在被调用的那一刻自己开一个短 session，用完就关，
+属于"流式阶段唯一的短时数据库访问"，不是长持有。
 
 关于两个后台任务的时机：
   它们都要调模型（1~3 秒），如果放在流式之前，用户要多等这么久才看到第一个字；
@@ -37,6 +40,7 @@ from security import get_current_user
 from services import conversation as conv_service
 from services import memory as memory_service
 from services import summary as summary_service
+from tools import bind_request_context, reset_request_context
 
 logger = logging.getLogger(__name__)
 
@@ -96,80 +100,94 @@ async def _persist_produced(conversation_id: uuid.UUID, produced: list[BaseMessa
 @router.post("/stream")
 async def chat_stream(req: ChatRequest, current_user=Depends(get_current_user)) -> StreamingResponse:
     async def event_generator() -> AsyncGenerator[str, None]:
-        # ====================== 阶段一：准备（短 session，用完即释放） ======================
-        async with SessionLocal() as db:
-            conversation = await conv_service.get_conversation(
-                db, current_user.id, req.conversation_id
-            )
-            if conversation is None:
-                yield _sse({"type": "error", "content": "会话不存在或无权访问"})
-                return
-
-            conversation_id = conversation.id
-            user_id = current_user.id
-
-            # 用户消息先落库：即使用户中途关掉页面，这句话也不会丢
-            user_message = await conv_service.append_message(db, conversation, "user", req.input)
-            # 记录本轮起点，记忆抽取只处理这条之后的消息
-            turn_seq = user_message.seq
-
-            # 会话还是默认标题时，用首条消息生成标题，侧边栏才不会全是"新会话"
-            if conversation.title == DEFAULT_CONVERSATION_TITLE:
-                await conv_service.rename_conversation(
-                    db, conversation, conv_service.make_title(req.input)
-                )
-
-            # L2：摘要 + 摘要线之后的原文
-            summary, rows = await conv_service.load_context(db, conversation)
-            history = conv_service.to_langchain_messages(rows)
-
-            # L3：长期记忆（这一步会顺带刷新 last_used_at）
-            memory_rows = await memory_service.load_for_prompt(db, user_id)
-
-            total_messages = conversation.message_count
-            need_compress = total_messages >= settings.SUMMARY_TRIGGER_MESSAGES
-        # —— session 已释放，下面整条流不再占用数据库连接 ——
-
-        # 记忆按效力分两组：
-        #   偏好 → 对输出形式的硬性要求，必须遵守
-        #   事实 → 只是背景，用来把问题讲对，不该影响回答长短
-        # 具体原因见 agent.build_system_prompt 的注释（混在一起写偏好会失效）。
-        preferences = [m.content for m in memory_rows if m.kind == "preference"]
-        facts = [m.content for m in memory_rows if m.kind != "preference"]
-
-        # 拼系统提示：基础人设 + 早期摘要 + 用户画像
-        system_prompt = build_system_prompt(summary, preferences, facts)
-
-        # L2 压缩放在后台跑：这一轮用旧摘要，下一轮就能用上新的，用户感知不到延迟。
-        # 幂等：压缩任务自己会判断"够不够压"，重复触发不会写出错误数据。
-        if need_compress:
-            spawn(
-                summary_service.compress_if_needed(conversation_id),
-                name=f"compress:{conversation_id}",
-            )
-
-        # ====================== 阶段二：流式生成 ======================
-        produced: list[BaseMessage] = []
+        # 把用户身份注入当前协程上下文，工具执行时靠它做权限过滤。
+        # 为什么不直接作为工具参数传：参数是模型生成的，模型可能被提示注入诱导，
+        # 把 user_id 换成别人的。放 contextvar 里，模型的输入根本没有这个字段。
+        context_token = bind_request_context(current_user.id)
         try:
-            async for event in stream_agent(history, produced, system_prompt=system_prompt):
-                yield _sse({"type": event.type, "content": event.content})
-        except asyncio.CancelledError:
-            # 用户中途断开（关页面 / 点新会话）。已生成的部分照样落库，然后正常退出。
-            raise
-        finally:
-            await _persist_produced(conversation_id, produced)
+            # ====================== 阶段一：准备（短 session，用完即释放） ======================
+            async with SessionLocal() as db:
+                conversation = await conv_service.get_conversation(
+                    db, current_user.id, req.conversation_id
+                )
+                if conversation is None:
+                    yield _sse({"type": "error", "content": "会话不存在或无权访问"})
+                    return
 
-            # L3 抽取放在落库之后：它要读数据库里的这一轮对话，落库没完成就抽不到。
-            # 只有真正产出了内容才抽——模型直接报错的话没有抽取价值。
-            if produced:
+                conversation_id = conversation.id
+                user_id = current_user.id
+
+                # 用户消息先落库：即使用户中途关掉页面，这句话也不会丢
+                user_message = await conv_service.append_message(
+                    db, conversation, "user", req.input
+                )
+                # 记录本轮起点，记忆抽取只处理这条之后的消息
+                turn_seq = user_message.seq
+
+                # 会话还是默认标题时，用首条消息生成标题，侧边栏才不会全是"新会话"
+                if conversation.title == DEFAULT_CONVERSATION_TITLE:
+                    await conv_service.rename_conversation(
+                        db, conversation, conv_service.make_title(req.input)
+                    )
+
+                # L2：摘要 + 摘要线之后的原文
+                summary, rows = await conv_service.load_context(db, conversation)
+                history = conv_service.to_langchain_messages(rows)
+
+                # L3：长期记忆。
+                # 传入本轮输入作为查询：记忆条数超过阈值时，事实类记忆会按语义相关度
+                # 召回而不是全量注入（见 services/memory.load_for_prompt）。
+                # 条数少的时候这一步完全不会触发 embedding 调用，不影响首字延迟。
+                memory_rows = await memory_service.load_for_prompt(db, user_id, req.input)
+
+                total_messages = conversation.message_count
+                need_compress = total_messages >= settings.SUMMARY_TRIGGER_MESSAGES
+            # —— session 已释放，下面整条流不再长持有数据库连接 ——
+
+            # 记忆按效力分两组：
+            #   偏好 → 对输出形式的硬性要求，必须遵守
+            #   事实 → 只是背景，用来把问题讲对，不该影响回答长短
+            # 具体原因见 agent.build_system_prompt 的注释（混在一起写偏好会失效）。
+            preferences = [m.content for m in memory_rows if m.kind == "preference"]
+            facts = [m.content for m in memory_rows if m.kind != "preference"]
+
+            # 拼系统提示：基础人设 + 早期摘要 + 用户画像
+            system_prompt = build_system_prompt(summary, preferences, facts)
+
+            # L2 压缩放在后台跑：这一轮用旧摘要，下一轮就能用上新的，用户感知不到延迟。
+            # 幂等：压缩任务自己会判断"够不够压"，重复触发不会写出错误数据。
+            if need_compress:
                 spawn(
-                    memory_service.extract_from_turn(conversation_id, user_id, turn_seq),
-                    name=f"memory:{conversation_id}",
+                    summary_service.compress_if_needed(conversation_id),
+                    name=f"compress:{conversation_id}",
                 )
 
-        # ====================== 阶段三：结束标记 ======================
-        # 前端收到 done 才解除 loading 状态
-        yield _sse({"type": "done"})
+            # ====================== 阶段二：流式生成 ======================
+            produced: list[BaseMessage] = []
+            try:
+                async for event in stream_agent(history, produced, system_prompt=system_prompt):
+                    yield _sse({"type": event.type, "content": event.content})
+            except asyncio.CancelledError:
+                # 用户中途断开（关页面 / 点新会话）。已生成的部分照样落库，然后正常退出。
+                raise
+            finally:
+                await _persist_produced(conversation_id, produced)
+
+                # L3 抽取放在落库之后：它要读数据库里的这一轮对话，落库没完成就抽不到。
+                # 只有真正产出了内容才抽——模型直接报错的话没有抽取价值。
+                if produced:
+                    spawn(
+                        memory_service.extract_from_turn(conversation_id, user_id, turn_seq),
+                        name=f"memory:{conversation_id}",
+                    )
+
+            # ====================== 阶段三：结束标记 ======================
+            # 前端收到 done 才解除 loading 状态
+            yield _sse({"type": "done"})
+        finally:
+            # 必须成对 reset：asyncio 的任务会继承父任务的上下文副本，
+            # 不还原的话，后续复用到这个生成器所在任务的逻辑可能读到别人的 user_id。
+            reset_request_context(context_token)
 
     return StreamingResponse(
         event_generator(),

@@ -18,22 +18,26 @@ import { onMounted, onUnmounted, ref } from 'vue'
 import { onUnauthorized } from './api/client'
 import ChatInput from './components/ChatInput.vue'
 import ChatWindow from './components/ChatWindow.vue'
+import KnowledgePanel from './components/KnowledgePanel.vue'
 import LoginView from './components/LoginView.vue'
 import MemoryPanel from './components/MemoryPanel.vue'
 import SessionSidebar from './components/SessionSidebar.vue'
 import { useAuth } from './composables/useAuth'
 import { useChat } from './composables/useChat'
 import { useConversations } from './composables/useConversations'
+import { useDocuments } from './composables/useDocuments'
 import { useMemories } from './composables/useMemories'
 
 const { user, restoring, isLoggedIn, login, restore, logout, clear } = useAuth()
 const conversations = useConversations()
 const memories = useMemories()
+const documents = useDocuments()
 
 const loginLoading = ref(false)
 const loginError = ref('')
 const loadingMessages = ref(false)
 const memoryOpen = ref(false)
+const knowledgeOpen = ref(false)
 const chatInputRef = ref<InstanceType<typeof ChatInput>>()
 
 /**
@@ -84,11 +88,12 @@ async function loadCurrent(): Promise<void> {
   }
 }
 
-/** 登录成功后：拉列表 + 拉记忆 + 恢复上次打开的会话 */
+/** 登录成功后：拉列表 + 拉记忆 + 拉知识库 + 恢复上次打开的会话 */
 async function bootstrap(): Promise<void> {
   await conversations.refresh()
-  // 记忆拉取失败不该拦住登录流程，用 catch 兜住
+  // 记忆 / 知识库拉取失败不该拦住登录流程，用 catch 兜住
   await memories.refresh().catch(() => {})
+  await documents.refresh().catch(() => {})
   // refresh 可能把失效的 currentId 换成第一个会话，也可能变成 null
   if (conversations.currentId.value) await loadCurrent()
   else chat.clear()
@@ -113,7 +118,9 @@ function handleLogout(): void {
   chat.clear()
   conversations.reset()
   memories.reset()
+  documents.reset()
   memoryOpen.value = false
+  knowledgeOpen.value = false
   logout()
 }
 
@@ -187,6 +194,41 @@ async function handleClearMemories(): Promise<void> {
   await memories.clearAll()
 }
 
+/** 打开知识库面板时重新拉一次：可能是另一个标签页刚传完文档 */
+async function handleOpenKnowledge(): Promise<void> {
+  knowledgeOpen.value = true
+  await documents.refresh().catch(() => {})
+}
+
+async function handleUpload(file: File): Promise<void> {
+  try {
+    await documents.upload(file)
+  } catch (error) {
+    // 失败原因（格式不支持 / 超过大小 / 未配置向量服务）后端都给了人话，直接透出
+    window.alert(error instanceof Error ? error.message : '上传失败，请重试')
+  }
+}
+
+async function handleRemoveDocument(id: string): Promise<void> {
+  const target = documents.items.value.find((item) => item.id === id)
+  if (!window.confirm(`删除「${target?.filename ?? '这份文档'}」？\n删除后 AI 就检索不到它的内容了。`)) {
+    return
+  }
+  try {
+    await documents.remove(id)
+  } catch {
+    window.alert('删除失败，请重试')
+  }
+}
+
+async function handleReindexDocument(id: string): Promise<void> {
+  try {
+    await documents.reindex(id)
+  } catch (error) {
+    window.alert(error instanceof Error ? error.message : '重新处理失败')
+  }
+}
+
 onMounted(async () => {
   // 任何接口返回 401 都统一退回登录页，并清掉本地残留状态
   onUnauthorized(() => {
@@ -194,7 +236,9 @@ onMounted(async () => {
     chat.clear()
     conversations.reset()
     memories.reset()
+    documents.reset()
     memoryOpen.value = false
+    knowledgeOpen.value = false
     clear()
   })
 
@@ -237,8 +281,10 @@ onUnmounted(() => {
         :has-conversation="Boolean(conversations.currentId.value)"
         :loading="loadingMessages"
         :memory-count="memories.items.value.length"
+        :knowledge-count="documents.readyCount()"
         @clear="handleClear"
         @open-memories="handleOpenMemories"
+        @open-knowledge="handleOpenKnowledge"
       />
       <ChatInput
         ref="chatInputRef"
@@ -260,6 +306,17 @@ onUnmounted(() => {
       @close="memoryOpen = false"
       @remove="handleRemoveMemory"
       @clear="handleClearMemories"
+    />
+
+    <KnowledgePanel
+      :open="knowledgeOpen"
+      :documents="documents.items.value"
+      :loading="documents.loading.value"
+      :uploading="documents.uploading.value"
+      @close="knowledgeOpen = false"
+      @upload="handleUpload"
+      @remove="handleRemoveDocument"
+      @reindex="handleReindexDocument"
     />
   </div>
 </template>
